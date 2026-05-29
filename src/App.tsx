@@ -76,6 +76,14 @@ export default function App() {
   const [relVerificationResult, setRelVerificationResult] = useState<any>(null);
   const [relLoading, setRelLoading] = useState(false);
   const [relError, setRelError] = useState('');
+  const [joinSelected, setJoinSelected] = useState<Set<string>>(new Set());
+  const [joinGeneratedSql, setJoinGeneratedSql] = useState('');
+  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
+  const [selectedRelTables, setSelectedRelTables] = useState<Set<string>>(new Set());
+  const [relAnalysisResult, setRelAnalysisResult] = useState<any>(null);
+  const [relSortBySelection, setRelSortBySelection] = useState(false);
+  const [relSimilarPage, setRelSimilarPage] = useState(0);
+  const PAGE_SIZE = 1000;
 
   useEffect(() => {
     fetch('/api/settings')
@@ -1584,6 +1592,14 @@ LIMIT 10;`;
     );
   };
 
+  const toggleSection = (key: string) => {
+    setCollapsedSections(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  };
+
   const handleFieldSearch = async () => {
     if (!relSearchQuery.trim() || !dbName) return;
     setRelLoading(true);
@@ -1646,12 +1662,12 @@ LIMIT 10;`;
     }
   };
 
-  const handleSaveRelationship = async (targetTable: string, targetField: string, similarity: number) => {
+  const handleSaveRelationship = async (targetTable: string, targetField: string, similarity: number, sourceTable?: string, sourceField?: string) => {
     try {
       const res = await fetch('/api/field-relationships', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ source_table: relTargetTable, source_field: relTargetField, target_table: targetTable, target_field: targetField, similarity, confidence: 'manual' })
+        body: JSON.stringify({ source_table: sourceTable || relTargetTable, source_field: sourceField || relTargetField, target_table: targetTable, target_field: targetField, similarity, confidence: 'manual' })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
@@ -1688,6 +1704,213 @@ JOIN ${targetTable} ${tgtAlias}
   ON ${srcAlias}."${sourceField}" = ${tgtAlias}."${targetField}"`;
   };
 
+  const generateMultiJoinSql = (tables?: string[]): string => {
+    const selected = tables || [...joinSelected];
+    if (selected.length < 2) return '';
+
+    const edges: { from: string; to: string; fromCol: string; toCol: string }[] = [];
+    for (const fk of foreignKeys) {
+      edges.push({ from: fk.source_table, to: fk.target_table, fromCol: fk.source_column, toCol: fk.target_column });
+      edges.push({ from: fk.target_table, to: fk.source_table, fromCol: fk.target_column, toCol: fk.source_column });
+    }
+
+    const graph: Record<string, { table: string; fromCol: string; toCol: string }[]> = {};
+    for (const e of edges) {
+      if (!graph[e.from]) graph[e.from] = [];
+      graph[e.from].push({ table: e.to, fromCol: e.fromCol, toCol: e.toCol });
+    }
+
+    const bfsPath = (start: string, end: string) => {
+      const queue: { table: string; path: typeof edges }[] = [{ table: start, path: [] }];
+      const visited = new Set([start]);
+      while (queue.length > 0) {
+        const cur = queue.shift()!;
+        for (const n of graph[cur.table] || []) {
+          if (visited.has(n.table)) continue;
+          visited.add(n.table);
+          const edge = { from: cur.table, to: n.table, fromCol: n.fromCol, toCol: n.toCol };
+          const newPath = [...cur.path, edge];
+          if (n.table === end) return newPath;
+          queue.push({ table: n.table, path: newPath });
+        }
+      }
+      return null;
+    };
+
+    const usedEdges: typeof edges = [];
+    const root = selected[0];
+    for (const table of selected.slice(1)) {
+      const path = bfsPath(root, table);
+      if (path) {
+        for (const e of path) {
+          if (!usedEdges.some(u => u.from === e.from && u.to === e.to && u.fromCol === e.fromCol)) {
+            usedEdges.push(e);
+          }
+        }
+      }
+    }
+
+    if (usedEdges.length === 0) return '-- 선택한 테이블 간 FK 연결 경로를 찾을 수 없습니다.';
+
+    const aliasMap: Record<string, string> = {};
+    const nextAlias = () => { let n = 0; return () => `t${n++}`; };
+    const getAlias = nextAlias();
+
+    for (const e of usedEdges) {
+      if (!aliasMap[e.from]) aliasMap[e.from] = getAlias();
+      if (!aliasMap[e.to]) aliasMap[e.to] = getAlias();
+    }
+    if (root && !aliasMap[root]) aliasMap[root] = getAlias();
+    for (const t of selected) {
+      if (!aliasMap[t]) aliasMap[t] = getAlias();
+    }
+
+    const firstTable = usedEdges[0].from;
+    let sql = `SELECT\n`;
+    const selectCols = [...new Set(selected.flatMap(t => {
+      const cols = (schemaDict[t] || []).map(c => c.split(' (')[0]);
+      return cols.map(c => `  ${aliasMap[t]}."${c}"`);
+    }))];
+    sql += selectCols.join(',\n');
+    sql += `\nFROM ${firstTable} ${aliasMap[firstTable]}\n`;
+
+    for (const e of usedEdges) {
+      if (e.from === firstTable) {
+        sql += `JOIN ${e.to} ${aliasMap[e.to]}\n  ON ${aliasMap[e.from]}."${e.fromCol}" = ${aliasMap[e.to]}."${e.toCol}"\n`;
+      }
+    }
+
+    const remaining = usedEdges.filter(e => e.from !== firstTable);
+    for (const e of remaining) {
+      sql += `JOIN ${e.to} ${aliasMap[e.to]}\n  ON ${aliasMap[e.from]}."${e.fromCol}" = ${aliasMap[e.to]}."${e.toCol}"\n`;
+    }
+
+    sql += `LIMIT 100;`;
+    return sql;
+  };
+
+  // ─── Client-side field similarity utilities ─────────────────────────
+
+  const normalizeFieldName = (name: string): string =>
+    name.toLowerCase().replace(/[_\-]/g, ' ').replace(/([a-z])([A-Z])/g, '$1 $2').trim();
+
+  const getTokens = (name: string): string[] =>
+    normalizeFieldName(name).split(/\s+/).filter(t => t.length > 0);
+
+  const jaccardSimilarity = (a: string[], b: string[]): number => {
+    const setA = new Set(a), setB = new Set(b);
+    const intersection = new Set([...setA].filter(x => setB.has(x)));
+    const union = new Set([...setA, ...setB]);
+    return union.size === 0 ? 0 : intersection.size / union.size;
+  };
+
+  const levenshtein = (a: string, b: string): number => {
+    const m = a.length, n = b.length;
+    const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+    for (let i = 0; i <= m; i++) dp[i][0] = i;
+    for (let j = 0; j <= n; j++) dp[0][j] = j;
+    for (let i = 1; i <= m; i++) {
+      for (let j = 1; j <= n; j++) {
+        dp[i][j] = a[i - 1] === b[j - 1]
+          ? dp[i - 1][j - 1]
+          : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+      }
+    }
+    return dp[m][n];
+  };
+
+  const fieldSimilarityScore = (name1: string, name2: string): { score: number; method: string } => {
+    const norm1 = normalizeFieldName(name1);
+    const norm2 = normalizeFieldName(name2);
+
+    if (norm1 === norm2) return { score: 1, method: 'exact' };
+
+    const tokens1 = getTokens(name1);
+    const tokens2 = getTokens(name2);
+
+    const jaccard = jaccardSimilarity(tokens1, tokens2);
+    if (jaccard >= 0.5) return { score: jaccard, method: 'token' };
+
+    const smaller = tokens1.length <= tokens2.length ? tokens1 : tokens2;
+    const larger = tokens1.length > tokens2.length ? tokens1 : tokens2;
+    if (smaller.every(t => larger.includes(t)) && smaller.length > 0) {
+      return { score: 0.6 + (smaller.length / larger.length) * 0.3, method: 'subset' };
+    }
+
+    const maxLen = Math.max(norm1.length, norm2.length);
+    if (maxLen === 0) return { score: 0, method: 'none' };
+    const dist = levenshtein(norm1, norm2);
+    const levScore = 1 - dist / maxLen;
+    if (levScore >= 0.7) return { score: levScore, method: 'fuzzy' };
+
+    return { score: 0, method: 'none' };
+  };
+
+  const handleAnalyzeRelations = () => {
+    const tables = [...selectedRelTables];
+    if (tables.length < 2) return;
+
+    setRelLoading(true);
+    setRelError('');
+
+    const fkConnections = foreignKeys.filter(
+      fk => tables.includes(fk.source_table) && tables.includes(fk.target_table)
+    );
+
+    const colToTables: Record<string, string[]> = {};
+    for (const t of tables) {
+      for (const c of (schemaDict[t] || [])) {
+        const base = c.split(' (')[0];
+        if (!colToTables[base]) colToTables[base] = [];
+        if (!colToTables[base].includes(t)) colToTables[base].push(t);
+      }
+    }
+    const commonColumns = Object.entries(colToTables)
+      .filter(([, ts]) => ts.length >= 2)
+      .sort((a, b) => b[1].length - a[1].length);
+
+    const joinSql = fkConnections.length > 0 ? generateMultiJoinSql(tables) : '';
+
+    // Client-side field similarity: compare columns across different tables
+    const similarFields: any[] = [];
+    const allCols: { table: string; field: string; type: string }[] = [];
+    for (const t of tables) {
+      for (const c of (schemaDict[t] || [])) {
+        const parts = c.split(' (');
+        allCols.push({ table: t, field: parts[0], type: parts[1]?.replace(')', '') || '' });
+      }
+    }
+    for (let i = 0; i < allCols.length; i++) {
+      for (let j = i + 1; j < allCols.length; j++) {
+        if (allCols[i].table === allCols[j].table) continue;
+        const { score, method } = fieldSimilarityScore(allCols[i].field, allCols[j].field);
+        if (score >= 0.6 && method !== 'exact') {
+          similarFields.push({
+            table1: allCols[i].table, field1: allCols[i].field, type1: allCols[i].type,
+            table2: allCols[j].table, field2: allCols[j].field, type2: allCols[j].type,
+            similarity: Math.round(score * 100) / 100,
+            method,
+          });
+        }
+      }
+    }
+    similarFields.sort((a, b) => b.similarity - a.similarity);
+
+    setRelSimilarPage(0);
+    setRelAnalysisResult({
+      tables,
+      fkConnections,
+      commonColumns,
+      similarFields: similarFields.slice(0, 1000),
+      joinSql,
+      totalTables: tables.length,
+      totalFk: fkConnections.length,
+      totalCommon: commonColumns.length,
+      totalSimilar: Math.min(similarFields.length, 1000),
+    });
+    setRelLoading(false);
+  };
+
   const renderRelationships = () => (
     <div className="max-w-7xl mx-auto space-y-8 animate-in fade-in duration-300">
       <div>
@@ -1698,94 +1921,77 @@ JOIN ${targetTable} ${tgtAlias}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
         {/* Left: Search + Selection */}
         <div className="lg:col-span-5 space-y-4">
-          {/* Quick Search (한글 포함) */}
-          {dbName ? (
-            <>
-              <div className="bg-white border border-gray-200 rounded-xl shadow-sm p-4 space-y-3">
-                <h4 className="text-sm font-semibold text-gray-700">🔎 필드 검색 (한글/영문)</h4>
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={relSearchQuery}
-                    onChange={(e) => setRelSearchQuery(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleFieldSearch()}
-                    placeholder="테이블명, 컬럼명, 한글 설명 검색..."
-                    className="flex-1 p-2.5 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                  />
-                  <button onClick={handleFieldSearch} disabled={relLoading} className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50 flex items-center gap-1">
-                    {relLoading ? <Loader2 size={14} className="animate-spin" /> : <Search size={14} />}
-                    검색
-                  </button>
-                </div>
-                {relSearchResults.length > 0 && (
-                  <div className="max-h-40 overflow-y-auto space-y-1 border border-gray-100 rounded-lg p-1">
-                    {relSearchResults.map((r, i) => (
-                      <div key={i} className="flex items-center justify-between px-2 py-1.5 hover:bg-blue-50 rounded cursor-pointer text-xs"
-                        onClick={() => { setRelTargetTable(r.table); setRelTargetField(r.field); setRelSuggestions([]); setRelVerificationResult(null); setRelSearchResults([]); setRelSearchQuery(''); }}
-                      >
-                        <span className="font-medium text-gray-800">{r.table}.{r.field}</span>
-                        <span className="text-gray-400">{r.type}{r.column_comment ? ` · ${r.column_comment}` : ''}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+          {/* Import from Table Manager */}
+          <button
+            onClick={() => {
+              const valid = activeTables.filter(t => schemaDict[t]);
+              setSelectedRelTables(new Set(valid));
+              setRelAnalysisResult(null);
+            }}
+            disabled={activeTables.length === 0}
+            className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 text-white text-sm font-medium rounded-lg transition-colors flex items-center justify-center gap-2"
+          >
+            <Download size={16} /> 테이블 정리 가져오기
+          </button>
 
-              {/* Target Selection */}
-              <div className="bg-white border border-gray-200 rounded-xl shadow-sm p-4 space-y-3">
-                <h4 className="text-sm font-semibold text-gray-700">🎯 대상 필드</h4>
-                <div>
-                  <label className="text-xs text-gray-500">테이블</label>
-                  <select
-                    value={relTargetTable}
-                    onChange={(e) => { setRelTargetTable(e.target.value); setRelTargetField(''); setRelSuggestions([]); }}
-                    className="w-full p-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none bg-white mt-1"
-                  >
-                    <option value="">테이블 선택</option>
-                    {Object.keys(schemaDict).filter(t => activeTables.length === 0 || activeTables.includes(t)).sort().map(t => (
-                      <option key={t} value={t}>{t}{bookmarkAliases[t] ? ` (${bookmarkAliases[t]})` : ''}</option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="text-xs text-gray-500">필드</label>
-                  <select
-                    value={relTargetField}
-                    onChange={(e) => setRelTargetField(e.target.value)}
-                    className="w-full p-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none bg-white mt-1"
-                    disabled={!relTargetTable}
-                  >
-                    <option value="">필드 선택</option>
-                    {(schemaDict[relTargetTable] || []).map(c => {
-                      const name = c.split(' (')[0];
-                      const type = c.split(' (')[1]?.replace(')', '') || '';
-                      return <option key={name} value={name}>{name} ({type})</option>;
-                    })}
-                  </select>
-                </div>
-                <button
-                  onClick={handleFindSimilar}
-                  disabled={!relTargetTable || !relTargetField || relLoading}
-                  className="w-full py-2.5 bg-gray-900 hover:bg-gray-800 text-white text-sm font-medium rounded-lg disabled:opacity-50 transition-colors flex items-center justify-center gap-2"
-                >
-                  {relLoading ? <Loader2 size={16} className="animate-spin" /> : <Link size={16} />}
-                  유사 필드 찾기
-                </button>
-              </div>
-            </>
-          ) : (
-            <div className="bg-blue-50 text-blue-800 text-sm p-5 rounded-xl border border-blue-100 text-center">
-              환경 설정에서 DB를 먼저 연결해주세요.
+          {/* Table Selection (분석할 테이블 선택) */}
+          <div className="bg-white border border-gray-200 rounded-xl shadow-sm p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <h4 className="text-sm font-semibold text-gray-800 flex items-center gap-2"><Table size={14} /> 분석할 테이블 선택</h4>
+              <button
+                onClick={() => setRelSortBySelection(v => !v)}
+                className={`text-[10px] px-1.5 py-0.5 rounded font-medium border transition-colors ${
+                  relSortBySelection
+                    ? 'bg-blue-100 border-blue-300 text-blue-700'
+                    : 'bg-gray-50 border-gray-200 text-gray-500 hover:bg-gray-100'
+                }`}
+              >
+                선택 정렬
+              </button>
             </div>
-          )}
+            <div className="max-h-48 overflow-y-auto space-y-1 border border-gray-100 rounded-lg p-1.5">
+              {(relSortBySelection
+                ? [...Object.keys(schemaDict)].sort((a, b) => {
+                    const aSel = selectedRelTables.has(a) ? 0 : 1;
+                    const bSel = selectedRelTables.has(b) ? 0 : 1;
+                    return aSel - bSel;
+                  })
+                : Object.keys(schemaDict).sort()
+              ).map(t => (
+                <label key={t} className="flex items-center gap-2 px-2 py-1 hover:bg-blue-50 rounded cursor-pointer text-xs">
+                  <input
+                    type="checkbox"
+                    checked={selectedRelTables.has(t)}
+                    onChange={() => {
+                      const next = new Set(selectedRelTables);
+                      if (next.has(t)) next.delete(t); else next.add(t);
+                      setSelectedRelTables(next);
+                      setRelAnalysisResult(null);
+                    }}
+                    className="w-3.5 h-3.5 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                  />
+                  <span className="text-gray-700 font-medium">{t}</span>
+                  <span className="text-gray-400">({(schemaDict[t] || []).length} cols)</span>
+                </label>
+              ))}
+            </div>
+            <button
+              onClick={handleAnalyzeRelations}
+              disabled={selectedRelTables.size < 2 || relLoading}
+              className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg disabled:opacity-50 transition-colors flex items-center justify-center gap-2"
+            >
+              {relLoading ? <Loader2 size={16} className="animate-spin" /> : <Link size={16} />}
+              {relLoading ? '분석 중...' : '통합 관계 분석'}
+            </button>
+          </div>
 
           {/* Foreign Key Relationships */}
-          {foreignKeys.length > 0 && (
-            <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
-              <div className="px-4 py-3 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
-                <h4 className="text-sm font-semibold text-gray-800 flex items-center gap-2"><Link size={14} className="text-green-600" /> 외래 키 관계 (FK)</h4>
-                <span className="text-xs text-gray-400">{foreignKeys.length}개</span>
-              </div>
+          <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
+            <div className="px-4 py-3 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
+              <h4 className="text-sm font-semibold text-gray-800 flex items-center gap-2"><Link size={14} className="text-green-600" /> 외래 키 관계 (FK)</h4>
+              <span className="text-xs text-gray-400">{foreignKeys.length}개</span>
+            </div>
+            {foreignKeys.length > 0 ? (
               <div className="max-h-60 overflow-y-auto p-2 space-y-1">
                 {foreignKeys.map((fk, i) => (
                   <div key={i} className="flex items-start gap-2 px-2 py-2 hover:bg-green-50 rounded text-xs border border-green-100">
@@ -1811,91 +2017,108 @@ JOIN ${targetTable} ${tgtAlias}
                   </div>
                 ))}
               </div>
-            </div>
-          )}
-
-          {/* Saved Relationships */}
-          <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
-            <div className="px-4 py-3 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
-              <h4 className="text-sm font-semibold text-gray-800 flex items-center gap-2"><Save size={14} /> 저장된 관계</h4>
-              <span className="text-xs text-gray-400">{savedRelationships.length}개</span>
-            </div>
-            <div className="max-h-60 overflow-y-auto p-2 space-y-1">
-              {savedRelationships.length === 0 ? (
-                <div className="text-xs text-gray-400 text-center py-4">저장된 관계가 없습니다.</div>
-              ) : (
-                savedRelationships.map((r: any, i: number) => (
-                  <div key={r.id || i} className="flex items-start gap-2 px-2 py-2 hover:bg-gray-50 rounded text-xs border border-gray-100">
-                    <div className="flex-1 min-w-0">
-                      <div className="font-medium text-gray-800 truncate">{r.source_table}.{r.source_field}</div>
-                      <div className="text-gray-400 text-[10px]">↔ {r.target_table}.{r.target_field}</div>
-                      <div className="flex gap-2 mt-1">
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-600">유사도: {Math.round(r.similarity * 100)}%</span>
-                        {r.verified === 1 && <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-50 text-green-600">값 검증됨</span>}
-                      </div>
-                    </div>
-                    <button onClick={() => handleDeleteRelationship(r.id)} className="p-1 text-red-400 hover:text-red-600 hover:bg-red-50 rounded shrink-0" title="삭제">
-                      <Trash2 size={12} />
-                    </button>
-                  </div>
-                ))
-              )}
-            </div>
+            ) : (
+              <div className="p-3 text-xs text-gray-400 text-center">DB에 FK 제약조건이 정의되어 있지 않습니다.</div>
+            )}
           </div>
 
-          {/* AI Prompt */}
+          {/* Saved Relationships - collapsible */}
           <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
-            <div className="px-4 py-3 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
-              <h4 className="text-sm font-semibold text-gray-800 flex items-center gap-2"><span className="text-purple-500">🤖</span> AI 프롬프트</h4>
-              <button
-                onClick={() => {
-                  const tables = Object.keys(schemaDict).sort();
-                  let prompt = `다음 PostgreSQL 데이터베이스의 스키마와 관계 정보를 분석해주세요.\n\n`;
-                  prompt += `## 테이블 목록\n`;
-                  for (const t of tables) {
-                    const cols = (schemaDict[t] || []).sort();
-                    prompt += `- ${t}: ${cols.join(', ')}\n`;
-                  }
-                  if (foreignKeys.length > 0) {
-                    prompt += `\n## 외래 키 관계 (FK)\n`;
-                    for (const fk of foreignKeys) {
-                      prompt += `- ${fk.source_table}.${fk.source_column} → ${fk.target_table}.${fk.target_column}\n`;
-                    }
-                  }
-                  const colToTables: Record<string, string[]> = {};
-                  for (const t of tables) {
-                    for (const c of (schemaDict[t] || [])) {
-                      const base = c.split(' (')[0];
-                      if (!colToTables[base]) colToTables[base] = [];
-                      if (!colToTables[base].includes(t)) colToTables[base].push(t);
-                    }
-                  }
-                  const common = Object.entries(colToTables).filter(([, ts]) => ts.length >= 2);
-                  if (common.length > 0) {
-                    prompt += `\n## 같은 이름의 컬럼을 가진 테이블들\n`;
-                    for (const [col, ts] of common) {
-                      prompt += `- ${col}: ${ts.join(', ')}\n`;
-                    }
-                  }
-                  if (savedRelationships.length > 0) {
-                    prompt += `\n## 저장된 관계\n`;
-                    for (const r of savedRelationships) {
-                      prompt += `- ${r.source_table}.${r.source_field} ↔ ${r.target_table}.${r.target_field} (유사도: ${Math.round(r.similarity * 100)}%)\n`;
-                    }
-                  }
-                  prompt += `\n## 요청\n`;
-                  prompt += `1. 각 테이블 간의 관계를 1:1, 1:N, N:M 중에서 설명해주세요.\n`;
-                  prompt += `2. 유용한 JOIN 쿼리 예제를 3-5개 알려주세요.\n`;
-                  prompt += `3. 특정 데이터를 조회하려면 어떤 테이블들을 어떻게 연결해야 하는지 알려주세요.\n`;
-                  prompt += `4. 데이터 분석 관점에서 유용한 인사이트를 알려주세요.\n`;
-                  setRelAiPrompt(prompt);
-                }}
-                className="text-xs px-2 py-1 rounded font-medium bg-purple-50 text-purple-700 hover:bg-purple-100 border border-purple-200"
-              >
-                생성
-              </button>
+            <div
+              className="px-4 py-3 bg-gray-50 border-b border-gray-200 flex items-center justify-between cursor-pointer select-none"
+              onClick={() => toggleSection('saved')}
+            >
+              <h4 className="text-sm font-semibold text-gray-800 flex items-center gap-2"><Save size={14} /> 저장된 관계</h4>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-gray-400">{savedRelationships.length}개</span>
+                {collapsedSections.has('saved') ? <ChevronRight size={16} className="text-gray-400" /> : <ChevronDown size={16} className="text-gray-400" />}
+              </div>
             </div>
-            {relAiPrompt && (
+            {!collapsedSections.has('saved') && (
+              <div className="max-h-60 overflow-y-auto p-2 space-y-1">
+                {savedRelationships.length === 0 ? (
+                  <div className="text-xs text-gray-400 text-center py-4">저장된 관계가 없습니다.</div>
+                ) : (
+                  savedRelationships.map((r: any, i: number) => (
+                    <div key={r.id || i} className="flex items-start gap-2 px-2 py-2 hover:bg-gray-50 rounded text-xs border border-gray-100">
+                      <div className="flex-1 min-w-0">
+                        <div className="font-medium text-gray-800 truncate">{r.source_table}.{r.source_field}</div>
+                        <div className="text-gray-400 text-[10px]">↔ {r.target_table}.{r.target_field}</div>
+                        <div className="flex gap-2 mt-1">
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-600">유사도: {Math.round(r.similarity * 100)}%</span>
+                          {r.verified === 1 && <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-50 text-green-600">값 검증됨</span>}
+                        </div>
+                      </div>
+                      <button onClick={() => handleDeleteRelationship(r.id)} className="p-1 text-red-400 hover:text-red-600 hover:bg-red-50 rounded shrink-0" title="삭제">
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* AI Prompt - collapsible */}
+          <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
+            <div
+              className="px-4 py-3 bg-gray-50 border-b border-gray-200 flex items-center justify-between cursor-pointer select-none"
+              onClick={() => toggleSection('ai')}
+            >
+              <h4 className="text-sm font-semibold text-gray-800 flex items-center gap-2"><span className="text-purple-500">🤖</span> AI 프롬프트</h4>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const tables = Object.keys(schemaDict).sort();
+                    let prompt = `다음 PostgreSQL 데이터베이스의 스키마와 관계 정보를 분석해주세요.\n\n`;
+                    prompt += `## 테이블 목록\n`;
+                    for (const t of tables) {
+                      const cols = (schemaDict[t] || []).sort();
+                      prompt += `- ${t}: ${cols.join(', ')}\n`;
+                    }
+                    if (foreignKeys.length > 0) {
+                      prompt += `\n## 외래 키 관계 (FK)\n`;
+                      for (const fk of foreignKeys) {
+                        prompt += `- ${fk.source_table}.${fk.source_column} → ${fk.target_table}.${fk.target_column}\n`;
+                      }
+                    }
+                    const colToTables: Record<string, string[]> = {};
+                    for (const t of tables) {
+                      for (const c of (schemaDict[t] || [])) {
+                        const base = c.split(' (')[0];
+                        if (!colToTables[base]) colToTables[base] = [];
+                        if (!colToTables[base].includes(t)) colToTables[base].push(t);
+                      }
+                    }
+                    const common = Object.entries(colToTables).filter(([, ts]) => ts.length >= 2);
+                    if (common.length > 0) {
+                      prompt += `\n## 같은 이름의 컬럼을 가진 테이블들\n`;
+                      for (const [col, ts] of common) {
+                        prompt += `- ${col}: ${ts.join(', ')}\n`;
+                      }
+                    }
+                    if (savedRelationships.length > 0) {
+                      prompt += `\n## 저장된 관계\n`;
+                      for (const r of savedRelationships) {
+                        prompt += `- ${r.source_table}.${r.source_field} ↔ ${r.target_table}.${r.target_field} (유사도: ${Math.round(r.similarity * 100)}%)\n`;
+                      }
+                    }
+                    prompt += `\n## 요청\n`;
+                    prompt += `1. 각 테이블 간의 관계를 1:1, 1:N, N:M 중에서 설명해주세요.\n`;
+                    prompt += `2. 유용한 JOIN 쿼리 예제를 3-5개 알려주세요.\n`;
+                    prompt += `3. 특정 데이터를 조회하려면 어떤 테이블들을 어떻게 연결해야 하는지 알려주세요.\n`;
+                    prompt += `4. 데이터 분석 관점에서 유용한 인사이트를 알려주세요.\n`;
+                    setRelAiPrompt(prompt);
+                  }}
+                  className="text-xs px-2 py-1 rounded font-medium bg-purple-50 text-purple-700 hover:bg-purple-100 border border-purple-200"
+                >
+                  생성
+                </button>
+                {collapsedSections.has('ai') ? <ChevronRight size={16} className="text-gray-400" /> : <ChevronDown size={16} className="text-gray-400" />}
+              </div>
+            </div>
+            {!collapsedSections.has('ai') && relAiPrompt && (
               <div className="p-2">
                 <textarea
                   value={relAiPrompt}
@@ -1913,7 +2136,7 @@ JOIN ${targetTable} ${tgtAlias}
           </div>
         </div>
 
-        {/* Right: Results */}
+        {/* Right: Unified Analysis Results */}
         <div className="lg:col-span-7 space-y-4">
           {relError && (
             <div className="text-sm text-red-600 bg-red-50 p-3 rounded-lg border border-red-100 flex items-start gap-2">
@@ -1921,101 +2144,215 @@ JOIN ${targetTable} ${tgtAlias}
             </div>
           )}
 
-          {relVerificationResult && (
-            <div className={`p-4 rounded-xl border ${relVerificationResult.overlap_count > 0 ? 'bg-green-50 border-green-200' : 'bg-yellow-50 border-yellow-200'}`}>
-              <div className="flex items-center justify-between">
-                <h4 className="text-sm font-semibold flex items-center gap-2">
-                  {relVerificationResult.overlap_count > 0 ? <Check size={16} className="text-green-600" /> : <AlertCircle size={16} className="text-yellow-600" />}
-                  값 중복 확인 결과
-                </h4>
-                <button onClick={() => setRelVerificationResult(null)} className="text-gray-400 hover:text-gray-600"><X size={14} /></button>
-              </div>
-              <div className="mt-2 text-xs space-y-1 text-gray-700">
-                <p><strong>{relVerificationResult.source_table}.{relVerificationResult.source_field}</strong> ↔ <strong>{relVerificationResult.target_table}.{relVerificationResult.target_field}</strong></p>
-                <p>일치하는 값: <strong>{relVerificationResult.overlap_count}</strong>개
-                  (source: {relVerificationResult.source_overlap_pct}% / target: {relVerificationResult.target_overlap_pct}%)</p>
-                <p>Source 전체: {relVerificationResult.source_total}건 · Target 전체: {relVerificationResult.target_total}건</p>
-              </div>
-              <div className="mt-2 flex gap-2">
-                <button
-                  onClick={() => handleSaveRelationship(relVerificationResult.target_table, relVerificationResult.target_field, 
-                    relSuggestions.find(s => s.table === relVerificationResult.target_table && s.field === relVerificationResult.target_field)?.similarity || 0.5)}
-                  className="px-3 py-1.5 bg-green-600 text-white text-xs font-medium rounded-lg hover:bg-green-700 transition-colors"
-                >
-                  이 관계 저장
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Suggestions */}
-          {relSuggestions.length > 0 && (
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <h3 className="text-lg font-semibold flex items-center gap-2 text-gray-800">
-                  <Link size={20} className="text-blue-600" /> 유사 필드 추천
-                </h3>
-                <span className="text-xs text-gray-400">총 {relSuggestions.length}개</span>
-              </div>
-              <div className="space-y-2 max-h-[600px] overflow-y-auto pr-1">
-                {relSuggestions.map((item, i) => {
-                  const pct = Math.round(item.similarity * 100);
-                  return (
-                    <div key={i} className={`bg-white border rounded-xl shadow-sm p-4 ${pct >= 80 ? 'border-green-200' : pct >= 50 ? 'border-blue-200' : 'border-gray-200'}`}>
-                      <div className="flex items-start justify-between gap-4">
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2">
-                            <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${
-                              pct >= 80 ? 'bg-green-100 text-green-700' : pct >= 50 ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-600'
-                            }`}>{pct}%</span>
-                            <span className="text-sm font-semibold text-gray-800">{item.table}</span>
-                            <span className="text-xs text-gray-400">{item.method}</span>
-                          </div>
-                          <div className="mt-1.5 flex items-center gap-3">
-                            <code className="text-xs bg-gray-100 px-2 py-1 rounded font-mono text-blue-700">{item.field}</code>
-                            <span className="text-xs text-gray-400">{item.type}</span>
-                          </div>
-                          {item.column_comment && <p className="text-xs text-gray-500 mt-1">📝 {item.column_comment}</p>}
-                          {item.table_comment && <p className="text-xs text-gray-400 mt-0.5">테이블: {item.table_comment}</p>}
-                        </div>
-                        <div className="flex flex-col gap-1.5 shrink-0">
-                          <button
-                            onClick={() => handleVerifyOverlap(item.table, item.field)}
-                            disabled={relVerifying[`${item.table}|${item.field}`]}
-                            className="px-3 py-1.5 bg-blue-600 text-white text-xs font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors flex items-center gap-1"
-                          >
-                            {relVerifying[`${item.table}|${item.field}`] ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />}
-                            값 검증
-                          </button>
-                          <button
-                            onClick={() => handleSaveRelationship(item.table, item.field, item.similarity)}
-                            className="px-3 py-1.5 bg-gray-800 text-white text-xs font-medium rounded-lg hover:bg-gray-700 transition-colors flex items-center gap-1"
-                          >
-                            <Save size={12} /> 저장
-                          </button>
-                          <button
-                            onClick={() => {
-                              const sql = generateJoinSql(relTargetTable, relTargetField, item.table, item.field);
-                              setGeneratedSql(sql);
-                              setActiveMenu('generator');
-                            }}
-                            className="px-3 py-1.5 bg-green-600 text-white text-xs font-medium rounded-lg hover:bg-green-700 transition-colors flex items-center gap-1"
-                          >
-                            <Code2 size={12} /> JOIN SQL
-                          </button>
-                        </div>
-                      </div>
+          {relAnalysisResult ? (
+            <div className="space-y-4">
+              {/* Analysis Summary */}
+              <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
+                <div className="px-4 py-3 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
+                  <h3 className="text-sm font-semibold text-gray-800 flex items-center gap-2"><Link size={16} className="text-blue-600" /> 통합 관계 분석 결과</h3>
+                  <button onClick={() => { setRelAnalysisResult(null); }} className="text-gray-400 hover:text-gray-600"><X size={14} /></button>
+                </div>
+                <div className="p-4 space-y-3">
+                  <div className="flex flex-wrap gap-2">
+                    <span className="text-[11px] px-2 py-1 rounded-full bg-blue-100 text-blue-700 font-medium">
+                      분석 대상: {relAnalysisResult.tables.join(', ')}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-4 gap-2">
+                    <div className="bg-gray-50 rounded-lg p-3 text-center">
+                      <div className="text-lg font-bold text-gray-800">{relAnalysisResult.totalTables}</div>
+                      <div className="text-[10px] text-gray-500">테이블</div>
                     </div>
-                  );
-                })}
+                    <div className="bg-gray-50 rounded-lg p-3 text-center">
+                      <div className="text-lg font-bold text-gray-800">{relAnalysisResult.totalFk}</div>
+                      <div className="text-[10px] text-gray-500">FK 관계</div>
+                    </div>
+                    <div className="bg-gray-50 rounded-lg p-3 text-center">
+                      <div className="text-lg font-bold text-gray-800">{relAnalysisResult.totalCommon}</div>
+                      <div className="text-[10px] text-gray-500">공통 컬럼</div>
+                    </div>
+                    <div className="bg-gray-50 rounded-lg p-3 text-center">
+                      <div className="text-lg font-bold text-gray-800">{relAnalysisResult.totalSimilar}</div>
+                      <div className="text-[10px] text-gray-500">유사 필드</div>
+                    </div>
+                  </div>
+                </div>
               </div>
-            </div>
-          )}
 
-          {!relSuggestions.length && !relError && !relVerificationResult && (
+              {/* FK Connections */}
+              {relAnalysisResult.fkConnections.length > 0 && (
+                <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
+                  <div className="px-4 py-3 bg-gray-50 border-b border-gray-200">
+                    <h4 className="text-sm font-semibold text-gray-800 flex items-center gap-2"><Link size={14} className="text-green-600" /> FK 연결 관계 ({relAnalysisResult.fkConnections.length}개)</h4>
+                  </div>
+                  <div className="max-h-48 overflow-y-auto p-2 space-y-1">
+                    {relAnalysisResult.fkConnections.map((fk: any, i: number) => (
+                      <div key={i} className="flex items-center justify-between px-2 py-1.5 hover:bg-green-50 rounded text-xs border border-green-100">
+                        <span className="text-gray-700 font-mono">
+                          <span className="text-green-700">{fk.source_table}</span>.<span className="text-blue-700">{fk.source_column}</span>
+                          <span className="text-gray-400"> → </span>
+                          <span className="text-green-700">{fk.target_table}</span>.<span className="text-blue-700">{fk.target_column}</span>
+                        </span>
+                        <button
+                          onClick={() => {
+                            const sql = generateJoinSql(fk.source_table, fk.source_column, fk.target_table, fk.target_column);
+                            setGeneratedSql(sql);
+                            setActiveMenu('generator');
+                          }}
+                          className="px-2 py-0.5 bg-green-600 text-white text-[10px] font-medium rounded hover:bg-green-700 transition-colors shrink-0 ml-2"
+                        >
+                          JOIN SQL
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Common Columns */}
+              {relAnalysisResult.commonColumns.length > 0 && (
+                <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
+                  <div className="px-4 py-3 bg-gray-50 border-b border-gray-200">
+                    <h4 className="text-sm font-semibold text-gray-800 flex items-center gap-2"><span className="text-purple-500">🔄</span> 공통 컬럼 ({relAnalysisResult.commonColumns.length}개)</h4>
+                  </div>
+                  <div className="max-h-48 overflow-y-auto p-2 space-y-1">
+                    {relAnalysisResult.commonColumns.map(([col, tables]: [string, string[]], i: number) => (
+                      <div key={i} className="flex items-center gap-2 px-2 py-1.5 hover:bg-purple-50 rounded text-xs border border-purple-100">
+                        <span className="font-mono font-medium text-gray-800">{col}</span>
+                        <span className="text-gray-400">→</span>
+                        <span className="text-gray-600 truncate">{tables.join(', ')}</span>
+                        <span className="text-[10px] text-purple-500 ml-auto shrink-0">{tables.length}개 테이블</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Similar Fields */}
+              {relAnalysisResult.similarFields && relAnalysisResult.similarFields.length > 0 && (
+                <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
+                  <div className="px-4 py-3 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
+                    <h4 className="text-sm font-semibold text-gray-800 flex items-center gap-2"><Search size={14} className="text-blue-500" /> 유사 필드 ({relAnalysisResult.similarFields.length}쌍)</h4>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => {
+                          const header = '유사도(%),테이블1,필드1,타입1,테이블2,필드2,타입2,방법';
+                          const rows = relAnalysisResult.similarFields.map((sf: any) =>
+                            `${Math.round(sf.similarity * 100)},${sf.table1},${sf.field1},${sf.type1},${sf.table2},${sf.field2},${sf.type2},${sf.method}`
+                          );
+                          const csv = '\uFEFF' + header + '\n' + rows.join('\n');
+                          const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                          const a = document.createElement('a');
+                          a.href = URL.createObjectURL(blob);
+                          a.download = `similar_fields_${new Date().toISOString().replace(/[:.]/g, '-')}.csv`;
+                          document.body.appendChild(a);
+                          a.click();
+                          document.body.removeChild(a);
+                          URL.revokeObjectURL(a.href);
+                        }}
+                        className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-green-50 text-green-700 hover:bg-green-100 border border-green-200 flex items-center gap-1"
+                      >
+                        <Download size={10} /> CSV
+                      </button>
+                      <span className="text-xs text-gray-400">{(relSimilarPage + 1) * PAGE_SIZE >= relAnalysisResult.similarFields.length ? '모두 표시' : `${Math.min((relSimilarPage + 1) * PAGE_SIZE, relAnalysisResult.similarFields.length)}개 표시 중`}</span>
+                    </div>
+                  </div>
+                  <div className="max-h-60 overflow-y-auto p-2 space-y-1">
+                    {relAnalysisResult.similarFields.slice(0, (relSimilarPage + 1) * PAGE_SIZE).map((sf: any, i: number) => {
+                      const pct = Math.round(sf.similarity * 100);
+                      return (
+                        <div key={i} className={`flex items-center justify-between px-2 py-1.5 rounded text-xs border ${pct >= 70 ? 'border-blue-200 bg-blue-50' : pct >= 50 ? 'border-indigo-200 bg-indigo-50' : 'border-gray-200 bg-gray-50'}`}>
+                          <div className="flex-1 min-w-0 flex items-center gap-2">
+                            <span className={`text-[10px] font-bold px-1 py-0.5 rounded shrink-0 ${pct >= 70 ? 'bg-blue-200 text-blue-800' : pct >= 50 ? 'bg-indigo-200 text-indigo-800' : 'bg-gray-200 text-gray-600'}`}>{pct}%</span>
+                            <span className="font-mono text-gray-800 truncate">
+                              <span className="text-blue-700">{sf.table1}</span>.<span className="text-gray-600">{sf.field1}</span>
+                              <span className="text-gray-400 mx-1">↔</span>
+                              <span className="text-blue-700">{sf.table2}</span>.<span className="text-gray-600">{sf.field2}</span>
+                            </span>
+                            <span className="text-gray-400 shrink-0">{sf.method}</span>
+                          </div>
+                          <div className="flex gap-1 shrink-0 ml-2">
+                            <button
+                              onClick={() => {
+                                const sql = generateJoinSql(sf.table1, sf.field1, sf.table2, sf.field2);
+                                setGeneratedSql(sql);
+                                setActiveMenu('generator');
+                              }}
+                              className="px-1.5 py-0.5 bg-green-600 text-white text-[10px] font-medium rounded hover:bg-green-700 transition-colors"
+                            >
+                              JOIN SQL
+                            </button>
+                            <button
+                              onClick={() => handleSaveRelationship(sf.table2, sf.field2, sf.similarity, sf.table1, sf.field1)}
+                              className="px-1.5 py-0.5 bg-gray-800 text-white text-[10px] font-medium rounded hover:bg-gray-700 transition-colors"
+                            >
+                              저장
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {(relSimilarPage + 1) * PAGE_SIZE < relAnalysisResult.similarFields.length && (
+                    <div className="px-3 pb-3">
+                      <button
+                        onClick={() => setRelSimilarPage(p => p + 1)}
+                        className="w-full py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-600 text-xs font-medium rounded-lg transition-colors"
+                      >
+                        더보기 (+{PAGE_SIZE})
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* JOIN SQL */}
+              {relAnalysisResult.joinSql && (
+                <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
+                  <div className="px-4 py-3 bg-gray-50 border-b border-gray-200">
+                    <h4 className="text-sm font-semibold text-gray-800 flex items-center gap-2"><Code2 size={14} className="text-orange-500" /> JOIN SQL</h4>
+                  </div>
+                  <div className="p-3 space-y-2">
+                    <textarea
+                      value={relAnalysisResult.joinSql}
+                      readOnly
+                      className="w-full h-36 p-2.5 text-xs font-mono bg-gray-900 text-gray-100 border border-gray-800 rounded-lg resize-y focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    />
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => navigator.clipboard.writeText(relAnalysisResult.joinSql)}
+                        className="flex-1 py-1.5 bg-gray-800 hover:bg-gray-700 text-white text-xs font-medium rounded-lg transition-colors"
+                      >
+                        복사
+                      </button>
+                      <button
+                        onClick={() => { setGeneratedSql(relAnalysisResult.joinSql); setActiveMenu('generator'); }}
+                        className="flex-1 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition-colors"
+                      >
+                        SQL 생성 메뉴로 보내기
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* No FK / No Common / No Similar */}
+              {relAnalysisResult.totalFk === 0 && relAnalysisResult.totalCommon === 0 && relAnalysisResult.totalSimilar === 0 && (
+                <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-4 text-center">
+                  <AlertCircle size={20} className="text-yellow-500 mx-auto mb-2" />
+                  <p className="text-sm text-yellow-700">선택한 테이블 간 FK 관계, 공통 컬럼, 유사 필드가 모두 없습니다.</p>
+                </div>
+              )}
+              {relAnalysisResult.totalFk === 0 && (relAnalysisResult.totalCommon > 0 || relAnalysisResult.totalSimilar > 0) && (
+                <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 text-center">
+                  <p className="text-xs text-blue-700">FK 제약조건이 없어 JOIN SQL이 생성되지 않았습니다. 유사 필드 또는 공통 컬럼을 참고하여 수동으로 JOIN을 작성해보세요.</p>
+                </div>
+              )}
+            </div>
+          ) : (
             <div className="bg-white border border-gray-200 rounded-xl shadow-sm p-12 text-center">
               <Link size={48} className="text-gray-300 mx-auto mb-4" />
-              <p className="text-gray-500 text-sm">좌측에서 대상 테이블과 필드를 선택한 후<br/><strong>"유사 필드 찾기"</strong>를 눌러주세요.</p>
+              <p className="text-gray-500 text-sm">좌측에서 분석할 테이블을 선택한 후<br/><strong>"통합 관계 분석"</strong>을 눌러주세요.</p>
               {savedRelationships.length > 0 && (
                 <div className="mt-6 pt-4 border-t border-gray-100">
                   <h4 className="text-sm font-semibold text-gray-700 mb-2">📋 저장된 관계로 생성 가능한 JOIN</h4>

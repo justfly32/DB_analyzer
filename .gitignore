@@ -9,3 +9,4 @@ coverage/
 *.db
 update.zip
 test_preset.mjs
+*sql-bot.bat

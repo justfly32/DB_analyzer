@@ -1,0 +1,5 @@
+{
+  "name": "Grafana SQL AI Generator",
+  "description": "A Text-to-SQL tool that generates Grafana-compatible SQL queries from natural language and database schemas.",
+  "requestFramePermissions": []
+}
